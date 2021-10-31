@@ -126,4 +126,3 @@ jobs:
           formula-name: dapptools-rs
         env:
           COMMITTER_TOKEN: ${{ secrets.G_TOKEN }}
-r
