@@ -6,12 +6,7 @@ on:
   workflow_dispatch:
 jobs:
   build-artifacts:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-          os:
-              - ubuntu-latest
-              - macOS-latest
+    runs-on:  ubuntu-latest
     steps:
       - name: Checkout sources
         uses: actions/checkout@v2
@@ -28,7 +23,7 @@ jobs:
       - name: Upload production artifacts
         uses: actions/upload-artifact@v2
         with:
-            name: target-${{ matrix.os }}
+            name: target-ubuntu-latest
             path: |
               ./target/elease/seth
               ./target/release/dapp
