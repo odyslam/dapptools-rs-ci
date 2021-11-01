@@ -25,7 +25,7 @@ jobs:
         with:
             name: target-ubuntu-latest
             path: |
-              ./target/elease/seth
+              ./target/release/seth
               ./target/release/dapp
   build-linux-packages:
     runs-on: ubuntu-latest
