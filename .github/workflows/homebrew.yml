@@ -4,8 +4,6 @@ on:
     tags:
       - 'v*.*.*'
 jobs:
-  on-success:
-    if: ${{github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: mislav/bump-homebrew-formula-action@v1.12
