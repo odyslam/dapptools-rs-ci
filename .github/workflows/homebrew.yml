@@ -2,8 +2,8 @@ name: Bump Homebrew version
 on:
   workflow_run:
     workflows: ["Release version"]
-  types:
-    - [completed]
+    types:
+      - [completed]
 jobs:
   on-success:
     if: ${{github.even.workflow_run.conclusion == 'success' }}
