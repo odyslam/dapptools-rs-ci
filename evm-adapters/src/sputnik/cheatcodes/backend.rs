@@ -1,3 +1,4 @@
+//! Cheatcode-enabled backend implementation
 use super::Cheatcodes;
 use ethers::types::{H160, H256, U256};
 use sputnik::backend::{Backend, Basic};
@@ -41,6 +42,10 @@ impl<B: Backend> Backend for CheatcodeBackend<B> {
 
     fn block_timestamp(&self) -> U256 {
         self.cheats.block_timestamp.unwrap_or_else(|| self.backend.block_timestamp())
+    }
+
+    fn block_base_fee_per_gas(&self) -> U256 {
+        self.cheats.block_base_fee_per_gas.unwrap_or_else(|| self.backend.block_base_fee_per_gas())
     }
 
     fn block_difficulty(&self) -> U256 {

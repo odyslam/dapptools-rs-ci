@@ -14,10 +14,15 @@ use ethers::{
 
 use sputnik::{
     backend::MemoryVicinity,
-    executor::{PrecompileOutput, StackExecutor, StackState},
+    executor::stack::{PrecompileFailure, PrecompileOutput, StackExecutor, StackState},
     Config, CreateScheme, ExitError, ExitReason, ExitSucceed,
 };
 
+pub use sputnik as sputnik_evm;
+use sputnik_evm::executor::stack::PrecompileSet;
+
+/// Given an ethers provider and a block, it proceeds to construct a [`MemoryVicinity`] from
+/// the live chain data returned by the provider.
 pub async fn vicinity<M: Middleware>(
     provider: &M,
     pin_block: Option<u64>,
@@ -43,6 +48,7 @@ pub async fn vicinity<M: Middleware>(
         block_difficulty: block.difficulty,
         block_gas_limit: block.gas_limit,
         block_timestamp: block.timestamp,
+        block_base_fee_per_gas: block.base_fee_per_gas.unwrap_or_default(),
         gas_price,
     })
 }
@@ -85,7 +91,9 @@ pub trait SputnikExecutor<S> {
 }
 
 // The implementation for the base Stack Executor just forwards to the internal methods.
-impl<'a, S: StackState<'a>> SputnikExecutor<S> for StackExecutor<'a, S> {
+impl<'a, 'b, S: StackState<'a>, P: PrecompileSet> SputnikExecutor<S>
+    for StackExecutor<'a, 'b, S, P>
+{
     fn config(&self) -> &Config {
         self.config()
     }
@@ -140,8 +148,9 @@ impl<'a, S: StackState<'a>> SputnikExecutor<S> for StackExecutor<'a, S> {
 use std::borrow::Cow;
 
 type PrecompileFn =
-    fn(&[u8], Option<u64>, &sputnik::Context, bool) -> Result<PrecompileOutput, ExitError>;
+    fn(&[u8], Option<u64>, &sputnik::Context, bool) -> Result<PrecompileOutput, PrecompileFailure>;
 
+/// Precompiled contracts which should be provided when instantiating the EVM.
 pub static PRECOMPILES: Lazy<revm_precompiles::Precompiles> = Lazy::new(|| {
     // We use the const to immediately choose the latest revision of available
     // precompiles. Is this wrong maybe?
@@ -153,7 +162,12 @@ pub static PRECOMPILES: Lazy<revm_precompiles::Precompiles> = Lazy::new(|| {
 // variables
 macro_rules! precompile_entry {
     ($map:expr, $index:expr) => {
-        let x: fn(&[u8], Option<u64>, &Context, bool) -> Result<PrecompileOutput, ExitError> =
+        let x: fn(
+            &[u8],
+            Option<u64>,
+            &Context,
+            bool,
+        ) -> Result<PrecompileOutput, PrecompileFailure> =
             |input: &[u8], gas_limit: Option<u64>, _context: &Context, _is_static: bool| {
                 let precompile = PRECOMPILES.get(&H160::from_low_u64_be($index)).unwrap();
                 crate::sputnik::exec(&precompile, input, gas_limit.unwrap())
@@ -165,6 +179,7 @@ macro_rules! precompile_entry {
 use once_cell::sync::Lazy;
 use sputnik::Context;
 use std::collections::BTreeMap;
+/// Map of Address => [Precompile](PRECOMPILES) contracts
 pub static PRECOMPILES_MAP: Lazy<BTreeMap<Address, PrecompileFn>> = Lazy::new(|| {
     let mut map = BTreeMap::new();
     precompile_entry!(map, 1);
@@ -179,11 +194,12 @@ pub static PRECOMPILES_MAP: Lazy<BTreeMap<Address, PrecompileFn>> = Lazy::new(||
     map
 });
 
+/// Runs the provided precompile against the input data.
 pub fn exec(
     builtin: &revm_precompiles::Precompile,
     input: &[u8],
     gas_limit: u64,
-) -> Result<PrecompileOutput, ExitError> {
+) -> Result<PrecompileOutput, PrecompileFailure> {
     let res = match builtin {
         revm_precompiles::Precompile::Standard(func) => func(input, gas_limit),
         revm_precompiles::Precompile::Custom(func) => func(input, gas_limit),
@@ -206,10 +222,8 @@ pub fn exec(
                 logs,
             })
         }
-        Err(err) => Err(match err {
-            revm_precompiles::ExitError::Exit => ExitError::Other(Cow::Borrowed("exit")),
-            revm_precompiles::ExitError::OutOfGas => ExitError::OutOfGas,
-            revm_precompiles::ExitError::Other(cow) => ExitError::Other(cow),
-        }),
+        Err(_) => {
+            Err(PrecompileFailure::Error { exit_status: ExitError::Other(Cow::Borrowed("error")) })
+        }
     }
 }

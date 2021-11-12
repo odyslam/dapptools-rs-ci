@@ -4,7 +4,9 @@ use ethers::types::{Address, Bytes, U256};
 
 use sputnik::{
     backend::{Backend, MemoryAccount},
-    executor::{MemoryStackState, StackExecutor, StackState, StackSubstateMetadata},
+    executor::stack::{
+        MemoryStackState, PrecompileSet, StackExecutor, StackState, StackSubstateMetadata,
+    },
     Config, CreateScheme, ExitReason, ExitRevert, Transfer,
 };
 use std::{collections::BTreeMap, marker::PhantomData};
@@ -17,6 +19,7 @@ pub type MemoryState = BTreeMap<Address, MemoryAccount>;
 
 // TODO: Check if we can implement this as the base layer of an ethers-provider
 // Middleware stack instead of doing RPC calls.
+/// Wrapper around Sputnik Executors which implements the [`Evm`] trait.
 pub struct Executor<S, E> {
     pub executor: E,
     pub gas_limit: u64,
@@ -24,24 +27,25 @@ pub struct Executor<S, E> {
 }
 
 impl<S, E> Executor<S, E> {
+    /// Instantiates the executor given a Sputnik instance.
     pub fn from_executor(executor: E, gas_limit: u64) -> Self {
         Self { executor, gas_limit, marker: PhantomData }
     }
 }
 
 // Concrete implementation over the in-memory backend without cheatcodes
-impl<'a, B: Backend>
-    Executor<MemoryStackState<'a, 'a, B>, StackExecutor<'a, MemoryStackState<'a, 'a, B>>>
+impl<'a, 'b, B: Backend, P: PrecompileSet>
+    Executor<MemoryStackState<'a, 'a, B>, StackExecutor<'a, 'b, MemoryStackState<'a, 'a, B>, P>>
 {
     /// Given a gas limit, vm version, initial chain configuration and initial state
     // TOOD: See if we can make lifetimes better here
-    pub fn new(gas_limit: u64, config: &'a Config, backend: &'a B) -> Self {
+    pub fn new(gas_limit: u64, config: &'a Config, backend: &'a B, precompiles: &'b P) -> Self {
         // setup gasometer
         let metadata = StackSubstateMetadata::new(gas_limit, config);
         // setup state
         let state = MemoryStackState::new(metadata, backend);
         // setup executor
-        let executor = StackExecutor::new_with_precompile(state, config, Default::default());
+        let executor = StackExecutor::new_with_precompiles(state, config, precompiles);
 
         Self { executor, gas_limit, marker: PhantomData }
     }
@@ -177,6 +181,7 @@ pub mod helpers {
             block_timestamp: Default::default(),
             block_difficulty: Default::default(),
             block_gas_limit: Default::default(),
+            block_base_fee_per_gas: Default::default(),
             chain_id: U256::one(),
         }
     }
@@ -190,17 +195,19 @@ mod tests {
     };
     use crate::test_helpers::{can_call_vm_directly, solidity_unit_test, COMPILED};
 
+    use crate::sputnik::PRECOMPILES_MAP;
     use ethers::utils::id;
     use sputnik::{ExitReason, ExitRevert, ExitSucceed};
 
     #[test]
     fn sputnik_can_call_vm_directly() {
         let cfg = Config::istanbul();
-        let compiled = COMPILED.get("Greeter").expect("could not find contract");
+        let compiled = COMPILED.find("Greeter").expect("could not find contract");
 
         let vicinity = new_vicinity();
         let backend = new_backend(&vicinity, Default::default());
-        let evm = Executor::new(12_000_000, &cfg, &backend);
+        let precompiles = PRECOMPILES_MAP.clone();
+        let evm = Executor::new(12_000_000, &cfg, &backend, &precompiles);
         can_call_vm_directly(evm, compiled);
     }
 
@@ -208,11 +215,12 @@ mod tests {
     fn sputnik_solidity_unit_test() {
         let cfg = Config::istanbul();
 
-        let compiled = COMPILED.get("GreeterTest").expect("could not find contract");
+        let compiled = COMPILED.find("GreeterTest").expect("could not find contract");
 
         let vicinity = new_vicinity();
         let backend = new_backend(&vicinity, Default::default());
-        let evm = Executor::new(12_000_000, &cfg, &backend);
+        let precompiles = PRECOMPILES_MAP.clone();
+        let evm = Executor::new(12_000_000, &cfg, &backend, &precompiles);
         solidity_unit_test(evm, compiled);
     }
 
@@ -220,14 +228,15 @@ mod tests {
     fn failing_with_no_reason_if_no_setup() {
         let cfg = Config::istanbul();
 
-        let compiled = COMPILED.get("GreeterTest").expect("could not find contract");
+        let compiled = COMPILED.find("GreeterTest").expect("could not find contract");
 
         let vicinity = new_vicinity();
         let backend = new_backend(&vicinity, Default::default());
-        let mut evm = Executor::new(12_000_000, &cfg, &backend);
+        let precompiles = PRECOMPILES_MAP.clone();
+        let mut evm = Executor::new(12_000_000, &cfg, &backend, &precompiles);
 
         let (addr, _, _, _) =
-            evm.deploy(Address::zero(), compiled.bytecode.clone(), 0.into()).unwrap();
+            evm.deploy(Address::zero(), compiled.bin.unwrap().clone(), 0.into()).unwrap();
 
         let (status, res) = evm.executor.transact_call(
             Address::zero(),
@@ -245,14 +254,15 @@ mod tests {
     fn failing_solidity_unit_test() {
         let cfg = Config::istanbul();
 
-        let compiled = COMPILED.get("GreeterTest").expect("could not find contract");
+        let compiled = COMPILED.find("GreeterTest").expect("could not find contract");
 
         let vicinity = new_vicinity();
         let backend = new_backend(&vicinity, Default::default());
-        let mut evm = Executor::new(12_000_000, &cfg, &backend);
+        let precompiles = PRECOMPILES_MAP.clone();
+        let mut evm = Executor::new(12_000_000, &cfg, &backend, &precompiles);
 
         let (addr, _, _, _) =
-            evm.deploy(Address::zero(), compiled.bytecode.clone(), 0.into()).unwrap();
+            evm.deploy(Address::zero(), compiled.bin.clone().unwrap().clone(), 0.into()).unwrap();
 
         // call the setup function to deploy the contracts inside the test
         let status = evm.setup(addr).unwrap().0;
@@ -266,27 +276,22 @@ mod tests {
             _ => panic!("unexpected error variant"),
         };
         assert_eq!(reason, "not equal to `hi`".to_string());
-        assert_eq!(gas_used, 30330);
+        assert_eq!(gas_used, 31233);
     }
 
     #[test]
     fn test_can_call_large_contract() {
         let cfg = Config::istanbul();
 
-        use dapp_solc::SolcBuilder;
-
-        let compiled = SolcBuilder::new("./testdata/LargeContract.sol", &[], &[])
-            .unwrap()
-            .build_all()
-            .unwrap();
-        let compiled = compiled.get("LargeContract").unwrap();
+        let compiled = COMPILED.find("LargeContract").expect("could not find contract");
 
         let vicinity = new_vicinity();
         let backend = new_backend(&vicinity, Default::default());
-        let mut evm = Executor::new(13_000_000, &cfg, &backend);
+        let precompiles = PRECOMPILES_MAP.clone();
+        let mut evm = Executor::new(13_000_000, &cfg, &backend, &precompiles);
 
         let from = Address::random();
-        let (addr, _, _, _) = evm.deploy(from, compiled.bytecode.clone(), 0.into()).unwrap();
+        let (addr, _, _, _) = evm.deploy(from, compiled.bin.unwrap().clone(), 0.into()).unwrap();
 
         // makes a call to the contract
         let sig = ethers::utils::id("foo()").to_vec();

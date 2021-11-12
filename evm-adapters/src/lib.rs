@@ -1,3 +1,4 @@
+#![doc = include_str!("../README.md")]
 #[cfg(feature = "sputnik")]
 /// Abstraction over [Sputnik EVM](https://github.com/rust-blockchain/evm)
 pub mod sputnik;
@@ -17,24 +18,28 @@ use ethers::{
     core::types::{Address, Bytes, U256},
 };
 
-use dapp_utils::IntoFunction;
+use foundry_utils::IntoFunction;
 
 use eyre::Result;
 use once_cell::sync::Lazy;
 
-// The account that we use to fund all the deployed contracts
+/// The account that we use to fund all the deployed contracts
 pub static FAUCET_ACCOUNT: Lazy<Address> =
     Lazy::new(|| Address::from_slice(&ethers::utils::keccak256("turbodapp faucet")[12..]));
 
+/// Errors related to the EVM call execution
 #[derive(thiserror::Error, Debug)]
 pub enum EvmError {
-    #[error(transparent)]
-    Eyre(#[from] eyre::Error),
     #[error("Execution reverted: {reason}, (gas: {gas_used})")]
     // TODO: Add proper log printing.
+    /// Error which occured during execution of an EVM transaction
     Execution { reason: String, gas_used: u64, logs: Vec<String> },
     #[error(transparent)]
+    /// Error which occured during ABI encoding / decoding of data
     AbiError(#[from] ethers::contract::AbiError),
+    #[error(transparent)]
+    /// Any other generic error
+    Eyre(#[from] eyre::Error),
 }
 
 // TODO: Any reason this should be an async trait?
@@ -64,6 +69,8 @@ pub trait Evm<State> {
     /// Resets the EVM's state to the provided value
     fn reset(&mut self, state: State);
 
+    /// Performs a [`call_unchecked`](Self::call_unchecked), checks if execution reverted, and
+    /// proceeds to return the decoded response to the user.
     fn call<D: Detokenize, T: Tokenize, F: IntoFunction>(
         &mut self,
         from: Address,
@@ -75,7 +82,7 @@ pub trait Evm<State> {
         let func = func.into();
         let (retdata, status, gas, logs) = self.call_unchecked(from, to, &func, args, value)?;
         if Self::is_fail(&status) {
-            let reason = dapp_utils::decode_revert(retdata.as_ref()).unwrap_or_default();
+            let reason = foundry_utils::decode_revert(retdata.as_ref()).unwrap_or_default();
             Err(EvmError::Execution { reason, gas_used: gas, logs })
         } else {
             let retdata = decode_function_data(&func, retdata, false)?;
@@ -179,16 +186,21 @@ pub trait Evm<State> {
 #[cfg(test)]
 mod test_helpers {
     use super::*;
-    use dapp_solc::SolcBuilder;
-    use ethers::{prelude::Lazy, utils::CompiledContract};
-    use std::collections::HashMap;
+    use ethers::{
+        prelude::Lazy,
+        solc::{artifacts::CompactContractRef, CompilerOutput, Project, ProjectPathsConfig},
+    };
 
-    pub static COMPILED: Lazy<HashMap<String, CompiledContract>> =
-        Lazy::new(|| SolcBuilder::new("./testdata/*.sol", &[], &[]).unwrap().build_all().unwrap());
+    pub static COMPILED: Lazy<CompilerOutput> = Lazy::new(|| {
+        let paths =
+            ProjectPathsConfig::builder().root("testdata").sources("testdata").build().unwrap();
+        let project = Project::builder().paths(paths).ephemeral().no_artifacts().build().unwrap();
+        project.compile().unwrap().output()
+    });
 
-    pub fn can_call_vm_directly<S, E: Evm<S>>(mut evm: E, compiled: &CompiledContract) {
+    pub fn can_call_vm_directly<S, E: Evm<S>>(mut evm: E, compiled: CompactContractRef) {
         let (addr, _, _, _) =
-            evm.deploy(Address::zero(), compiled.bytecode.clone(), 0.into()).unwrap();
+            evm.deploy(Address::zero(), compiled.bin.unwrap().clone(), 0.into()).unwrap();
 
         let (_, status1, _, _) = evm
             .call::<(), _, _>(Address::zero(), addr, "greet(string)", "hi".to_owned(), 0.into())
@@ -205,9 +217,9 @@ mod test_helpers {
         });
     }
 
-    pub fn solidity_unit_test<S, E: Evm<S>>(mut evm: E, compiled: &CompiledContract) {
+    pub fn solidity_unit_test<S, E: Evm<S>>(mut evm: E, compiled: CompactContractRef) {
         let (addr, _, _, _) =
-            evm.deploy(Address::zero(), compiled.bytecode.clone(), 0.into()).unwrap();
+            evm.deploy(Address::zero(), compiled.bin.unwrap().clone(), 0.into()).unwrap();
 
         // call the setup function to deploy the contracts inside the test
         let status1 = evm.setup(addr).unwrap().0;

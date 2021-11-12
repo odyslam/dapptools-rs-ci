@@ -1,3 +1,4 @@
+//! Fuzzing support abstracted over the [`Evm`](crate::Evm) used
 use crate::Evm;
 use ethers::{
     abi::{Function, ParamType, Token, Tokenizable},
@@ -15,21 +16,28 @@ use proptest::{
 
 pub use proptest::test_runner::Config as FuzzConfig;
 
+/// Wrapper around any [`Evm`](crate::Evm) implementor which provides fuzzing support using [`proptest`](https://docs.rs/proptest/1.0.0/proptest/).
+///
+/// After instantiation, calling `fuzz` will proceed to hammer the deployed smart contract with
+/// inputs, until it finds a counterexample. The provided `TestRunner` contains all the
+/// configuration which can be overriden via [environment variables](https://docs.rs/proptest/1.0.0/proptest/test_runner/struct.Config.html)
 #[derive(Debug)]
 pub struct FuzzedExecutor<'a, E, S> {
     evm: RefCell<&'a mut E>,
     runner: TestRunner,
     state: PhantomData<S>,
+    sender: Address,
 }
 
 impl<'a, S, E: Evm<S>> FuzzedExecutor<'a, E, S> {
+    /// Returns a mutable reference to the fuzzer's internal EVM instance
     pub fn as_mut(&self) -> RefMut<'_, &'a mut E> {
         self.evm.borrow_mut()
     }
 
     /// Instantiates a fuzzed executor EVM given a testrunner
-    pub fn new(evm: &'a mut E, runner: TestRunner) -> Self {
-        Self { evm: RefCell::new(evm), runner, state: PhantomData }
+    pub fn new(evm: &'a mut E, runner: TestRunner, sender: Address) -> Self {
+        Self { evm: RefCell::new(evm), runner, state: PhantomData, sender }
     }
 
     /// Fuzzes the provided function, assuming it is available at the contract at `address`
@@ -61,7 +69,7 @@ impl<'a, S, E: Evm<S>> FuzzedExecutor<'a, E, S> {
             evm.reset(pre_test_state.clone());
 
             let (returndata, reason, _, _) = evm
-                .call_raw(Address::zero(), address, calldata, 0.into(), false)
+                .call_raw(self.sender, address, calldata, 0.into(), false)
                 .expect("could not make raw evm call");
 
             // We must check success before resetting the state, otherwise resetting the state
@@ -74,7 +82,7 @@ impl<'a, S, E: Evm<S>> FuzzedExecutor<'a, E, S> {
                 "{}, expected failure: {}, reason: '{}'",
                 func.name,
                 should_fail,
-                dapp_utils::decode_revert(returndata.as_ref())?
+                foundry_utils::decode_revert(returndata.as_ref())?
             );
 
             Ok(())
@@ -82,6 +90,8 @@ impl<'a, S, E: Evm<S>> FuzzedExecutor<'a, E, S> {
     }
 }
 
+/// Given a function, it returns a proptest strategy which generates valid abi-encoded calldata
+/// for that function's input types.
 pub fn fuzz_calldata(func: &Function) -> impl Strategy<Value = Bytes> + '_ {
     // We need to compose all the strategies generated for each parameter in all
     // possible combinations
@@ -96,6 +106,8 @@ pub fn fuzz_calldata(func: &Function) -> impl Strategy<Value = Bytes> + '_ {
 /// The max length of arrays we fuzz for is 256.
 const MAX_ARRAY_LEN: usize = 256;
 
+/// Given an ethabi parameter type, returns a proptest strategy for generating values for that
+/// datatype. Works with ABI Encoder v2 tuples.
 fn fuzz_param(param: &ParamType) -> impl Strategy<Value = Token> {
     match param {
         ParamType::Address => {

@@ -1,18 +1,31 @@
 // Taken from:
 // https://github.com/dapphub/dapptools/blob/e41b6cd9119bbd494aba1236838b859f2136696b/src/dapp-tests/pass/cheatCodes.sol
-pragma solidity ^0.6.7;
+pragma solidity ^0.6.6;
 pragma experimental ABIEncoderV2;
 
 import "./DsTest.sol";
 
 interface Hevm {
+    // Set block.timestamp (newTimestamp)
     function warp(uint256) external;
+    // Set block.height (newHeight)
     function roll(uint256) external;
+    // Loads a storage slot from an address (who, slot)
     function load(address,bytes32) external returns (bytes32);
+    // Stores a value to an address' storage slot, (who, slot, value)
     function store(address,bytes32,bytes32) external;
+    // Signs data, (privateKey, digest) => (r, v, s)
     function sign(uint256,bytes32) external returns (uint8,bytes32,bytes32);
+    // Gets address for a given private key, (privateKey) => (address)
     function addr(uint256) external returns (address);
+    // Performs a foreign function call via terminal, (stringInputs) => (result)
     function ffi(string[] calldata) external returns (bytes memory);
+    // Calls another contract with a specified `msg.sender`, (newSender, contract, input) => (success, returnData)
+    function prank(address, address, bytes calldata) external payable returns (bool, bytes memory);
+    // Sets an address' balance, (who, newBalance)
+    function deal(address, uint256) external;
+    // Sets an address' code, (who, newCode)
+    function etch(address, bytes calldata) external;
 }
 
 contract HasStorage {
@@ -24,6 +37,7 @@ contract HasStorage {
 contract CheatCodes is DSTest {
     address public store = address(new HasStorage());
     Hevm constant hevm = Hevm(HEVM_ADDRESS);
+    address public who = hevm.addr(1);
 
     // Warp
 
@@ -128,5 +142,96 @@ contract CheatCodes is DSTest {
         bytes memory res = hevm.ffi(inputs);
         (string memory output) = abi.decode(res, (string));
         assertEq(output, "acab");
+    }
+
+    function testDeal() public {
+        address addr = address(1337);
+        hevm.deal(addr, 1337);
+        assertEq(addr.balance, 1337);
+    }
+
+    function testPrank() public {
+        Prank prank = new Prank();
+        address new_sender = address(1337);
+        bytes4 sig = prank.checksOriginAndSender.selector;
+        string memory input = "And his name is JOHN CENA!";
+        bytes memory calld = abi.encodePacked(sig, abi.encode(input));
+        address origin = tx.origin;
+        address sender = msg.sender;
+        (bool success, bytes memory ret) = hevm.prank(new_sender, address(prank), calld);
+        assertTrue(success);
+        string memory expectedRetString = "SUPER SLAM!";
+        string memory actualRet = abi.decode(ret, (string));
+        assertEq(actualRet, expectedRetString);
+
+        // make sure we returned back to normal
+        assertEq(origin, tx.origin);
+        assertEq(sender, msg.sender);
+    }
+
+    function testPrankValue() public {
+        Prank prank = new Prank();
+        // setup the call
+        address new_sender = address(1337);
+        bytes4 sig = prank.checksOriginAndSender.selector;
+        string memory input = "And his name is JOHN CENA!";
+        bytes memory calld = abi.encodePacked(sig, abi.encode(input));
+        address origin = tx.origin;
+        address sender = msg.sender;
+
+        // give the sender some monies
+        hevm.deal(new_sender, 1337);
+
+        // call the function passing in a value. the eth is pulled from the new sender
+        sig = hevm.prank.selector;
+        calld = abi.encodePacked(sig, abi.encode(new_sender, address(prank), calld));
+
+        // this is nested low level calls effectively
+        (bool high_level_success, bytes memory outerRet) = address(hevm).call{value: 1}(calld);
+        assertTrue(high_level_success);
+        (bool success, bytes memory ret) = abi.decode(outerRet, (bool,bytes));
+        assertTrue(success);
+        string memory expectedRetString = "SUPER SLAM!";
+        string memory actualRet = abi.decode(ret, (string));
+        assertEq(actualRet, expectedRetString);
+
+        // make sure we returned back to normal
+        assertEq(origin, tx.origin);
+        assertEq(sender, msg.sender);
+    }
+
+    function testEtch() public {
+        address rewriteCode = address(1337);
+        
+        bytes memory newCode = hex"1337";
+        hevm.etch(rewriteCode, newCode);
+        bytes memory n_code = getCode(rewriteCode);
+        assertEq(string(newCode), string(n_code));
+    }
+
+    function getCode(address who) internal returns (bytes memory o_code) {
+        assembly {
+            // retrieve the size of the code, this needs assembly
+            let size := extcodesize(who)
+            // allocate output byte array - this could also be done without assembly
+            // by using o_code = new bytes(size)
+            o_code := mload(0x40)
+            // new "memory end" including padding
+            mstore(0x40, add(o_code, and(add(add(size, 0x20), 0x1f), not(0x1f))))
+            // store length in memory
+            mstore(o_code, size)
+            // actually retrieve the code, this needs assembly
+            extcodecopy(who, add(o_code, 0x20), 0, size)
+        }
+    }
+}
+
+contract Prank is DSTest {
+    function checksOriginAndSender(string calldata input) external payable returns (string memory) {
+        string memory expectedInput = "And his name is JOHN CENA!";
+        assertEq(input, expectedInput);
+        assertEq(address(1337), msg.sender);
+        string memory expectedRetString = "SUPER SLAM!";
+        return expectedRetString;
     }
 }

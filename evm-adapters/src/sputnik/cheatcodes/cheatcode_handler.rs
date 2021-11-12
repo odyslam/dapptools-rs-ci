@@ -1,16 +1,18 @@
+//! Hooks to EVM execution
 use super::{
     backend::CheatcodeBackend, memory_stackstate_owned::MemoryStackStateOwned, HEVMCalls,
     HevmConsoleEvents,
 };
 use crate::{
-    sputnik::{Executor, SputnikExecutor, PRECOMPILES_MAP},
+    sputnik::{Executor, SputnikExecutor},
     Evm,
 };
 
 use sputnik::{
     backend::Backend,
-    executor::{
-        Log, PrecompileOutput, StackExecutor, StackExitKind, StackState, StackSubstateMetadata,
+    executor::stack::{
+        Log, PrecompileFailure, PrecompileOutput, PrecompileSet, StackExecutor, StackExitKind,
+        StackState, StackSubstateMetadata,
     },
     gasometer, Capture, Config, Context, CreateScheme, ExitError, ExitReason, ExitRevert,
     ExitSucceed, Handler, Runtime, Transfer,
@@ -20,8 +22,7 @@ use std::{process::Command, rc::Rc};
 use ethers::{
     abi::{RawLog, Token},
     contract::EthLogDecode,
-    core::{k256::ecdsa::SigningKey, utils},
-    prelude::AbiDecode,
+    core::{abi::AbiDecode, k256::ecdsa::SigningKey, utils},
     signers::{LocalWallet, Signer},
     types::{Address, H160, H256, U256},
 };
@@ -31,10 +32,20 @@ use once_cell::sync::Lazy;
 
 // This is now getting us the right hash? Also tried [..20]
 // Lazy::new(|| Address::from_slice(&keccak256("hevm cheat code")[12..]));
+/// Address where the Vm cheatcodes contract lives
 pub static CHEATCODE_ADDRESS: Lazy<Address> = Lazy::new(|| {
     Address::from_slice(&hex::decode("7109709ECfa91a80626fF3989D68f67F5b1DD12D").unwrap())
 });
 
+/// Hooks on live EVM execution and forwards everything else to a Sputnik [`Handler`].
+///
+/// It allows:
+/// 1. Logging of values for debugging
+/// 2. Modifying chain state live with cheatcodes
+///
+/// The `call_inner` and `create_inner` functions are copy-pasted from upstream, so that
+/// it can hook in the runtime. They may eventually be removed if Sputnik allows bringing in your
+/// own runtime handler.
 #[derive(Clone, Debug)]
 // TODO: Should this be called `HookedHandler`? Maybe we could implement other hooks
 // here, e.g. hardhat console.log-style, or dapptools logs, some ad-hoc method for tracing
@@ -46,7 +57,9 @@ pub struct CheatcodeHandler<H> {
 
 // Forwards everything internally except for the transact_call which is overwritten.
 // TODO: Maybe we can pull this functionality up to the `Evm` trait to avoid having so many traits?
-impl<'a, B: Backend> SputnikExecutor<CheatcodeStackState<'a, B>> for CheatcodeStackExecutor<'a, B> {
+impl<'a, 'b, B: Backend, P: PrecompileSet> SputnikExecutor<CheatcodeStackState<'a, B>>
+    for CheatcodeStackExecutor<'a, 'b, B, P>
+{
     fn config(&self) -> &Config {
         self.handler.config()
     }
@@ -80,15 +93,9 @@ impl<'a, B: Backend> SputnikExecutor<CheatcodeStackState<'a, B>> for CheatcodeSt
         }
 
         // Initialize initial addresses for EIP-2929
+        // Initialize initial addresses for EIP-2929
         if self.config().increase_state_access_gas {
-            let addresses = self
-                .handler
-                .precompile()
-                .clone()
-                .into_keys()
-                .into_iter()
-                .chain(core::iter::once(caller))
-                .chain(core::iter::once(address));
+            let addresses = core::iter::once(caller).chain(core::iter::once(address));
             self.state_mut().metadata_mut().access_addresses(addresses);
 
             self.handler.initialize_with_access_list(access_list);
@@ -121,7 +128,24 @@ impl<'a, B: Backend> SputnikExecutor<CheatcodeStackState<'a, B>> for CheatcodeSt
         gas_limit: u64,
         access_list: Vec<(H160, Vec<H256>)>,
     ) -> ExitReason {
-        self.handler.transact_create(caller, value, init_code, gas_limit, access_list)
+        let transaction_cost = gasometer::create_transaction_cost(&init_code, &access_list);
+        match self.state_mut().metadata_mut().gasometer_mut().record_transaction(transaction_cost) {
+            Ok(()) => (),
+            Err(e) => return e.into(),
+        };
+        self.handler.initialize_with_access_list(access_list);
+
+        match self.create_inner(
+            caller,
+            CreateScheme::Legacy { caller },
+            value,
+            init_code,
+            Some(gas_limit),
+            false,
+        ) {
+            Capture::Exit((s, _, _)) => s,
+            Capture::Trap(_) => unreachable!(),
+        }
     }
 
     fn create_address(&self, scheme: CreateScheme) -> Address {
@@ -173,16 +197,23 @@ impl<'a, B: Backend> SputnikExecutor<CheatcodeStackState<'a, B>> for CheatcodeSt
     }
 }
 
+/// A [`MemoryStackStateOwned`] state instantiated over a [`CheatcodeBackend`]
 pub type CheatcodeStackState<'a, B> = MemoryStackStateOwned<'a, CheatcodeBackend<B>>;
 
-pub type CheatcodeStackExecutor<'a, B> =
-    CheatcodeHandler<StackExecutor<'a, CheatcodeStackState<'a, B>>>;
+/// A [`CheatcodeHandler`] which uses a [`CheatcodeStackState`] to store its state and a
+/// [`StackExecutor`] for executing transactions.
+pub type CheatcodeStackExecutor<'a, 'b, B, P> =
+    CheatcodeHandler<StackExecutor<'a, 'b, CheatcodeStackState<'a, B>, P>>;
 
-impl<'a, B: Backend> Executor<CheatcodeStackState<'a, B>, CheatcodeStackExecutor<'a, B>> {
+impl<'a, 'b, B: Backend, P: PrecompileSet>
+    Executor<CheatcodeStackState<'a, B>, CheatcodeStackExecutor<'a, 'b, B, P>>
+{
+    /// Instantiates a cheatcode-enabled [`Executor`]
     pub fn new_with_cheatcodes(
         backend: B,
         gas_limit: u64,
         config: &'a Config,
+        precompiles: &'b P,
         enable_ffi: bool,
     ) -> Self {
         // make this a cheatcode-enabled backend
@@ -194,7 +225,7 @@ impl<'a, B: Backend> Executor<CheatcodeStackState<'a, B>, CheatcodeStackExecutor
         let state = MemoryStackStateOwned::new(metadata, backend);
 
         // create the executor and wrap it with the cheatcode handler
-        let executor = StackExecutor::new_with_precompile(state, config, PRECOMPILES_MAP.clone());
+        let executor = StackExecutor::new_with_precompiles(state, config, precompiles);
         let executor = CheatcodeHandler { handler: executor, enable_ffi };
 
         let mut evm = Executor::from_executor(executor, gas_limit);
@@ -207,6 +238,7 @@ impl<'a, B: Backend> Executor<CheatcodeStackState<'a, B>, CheatcodeStackExecutor
     }
 }
 
+// helper for creating an exit type
 fn evm_error(retdata: &str) -> Capture<(ExitReason, Vec<u8>), Infallible> {
     Capture::Exit((
         ExitReason::Revert(ExitRevert::Reverted),
@@ -214,14 +246,19 @@ fn evm_error(retdata: &str) -> Capture<(ExitReason, Vec<u8>), Infallible> {
     ))
 }
 
-impl<'a, B: Backend> CheatcodeStackExecutor<'a, B> {
-    /// Decodes the provided calldata as a
-    fn apply_cheatcode(&mut self, input: Vec<u8>) -> Capture<(ExitReason, Vec<u8>), Infallible> {
+impl<'a, 'b, B: Backend, P: PrecompileSet> CheatcodeStackExecutor<'a, 'b, B, P> {
+    /// Given a transaction's calldata, it tries to parse it as an [`HEVM cheatcode`](super::HEVM)
+    /// call and modify the state accordingly.
+    fn apply_cheatcode(
+        &mut self,
+        input: Vec<u8>,
+        transfer: Option<Transfer>,
+        target_gas: Option<u64>,
+    ) -> Capture<(ExitReason, Vec<u8>), Infallible> {
         let mut res = vec![];
 
         // Get a mutable ref to the state so we can apply the cheats
         let state = self.state_mut();
-
         let decoded = match HEVMCalls::decode(&input) {
             Ok(inner) => inner,
             Err(err) => return evm_error(&err.to_string()),
@@ -248,7 +285,7 @@ impl<'a, B: Backend> CheatcodeStackExecutor<'a, B> {
                 if !self.enable_ffi {
                     return evm_error(
                         "ffi disabled: run again with --ffi if you want to allow tests to call external scripts",
-                    )
+                    );
                 }
 
                 // execute the command & get the stdout
@@ -314,10 +351,48 @@ impl<'a, B: Backend> CheatcodeStackExecutor<'a, B> {
                     Token::FixedBytes(s_bytes.to_vec()),
                 ])]);
             }
+            HEVMCalls::Prank(inner) => {
+                let caller = inner.0;
+                let address = inner.1;
+                let input = inner.2;
+
+                let value =
+                    if let Some(ref transfer) = transfer { transfer.value } else { U256::zero() };
+
+                // change origin
+                let context = Context { caller, address, apparent_value: value };
+                let ret = self.call(
+                    address,
+                    Some(Transfer { source: caller, target: address, value }),
+                    input,
+                    target_gas,
+                    false,
+                    context,
+                );
+                res = match ret {
+                    Capture::Exit((successful, v)) => match successful {
+                        ExitReason::Succeed(_) => {
+                            ethers::abi::encode(&[Token::Bool(true), Token::Bytes(v.to_vec())])
+                        }
+                        _ => ethers::abi::encode(&[Token::Bool(false), Token::Bytes(v.to_vec())]),
+                    },
+                    _ => vec![],
+                };
+            }
+            HEVMCalls::Deal(inner) => {
+                let who = inner.0;
+                let value = inner.1;
+                state.reset_balance(who);
+                state.deposit(who, value);
+            }
+            HEVMCalls::Etch(inner) => {
+                let who = inner.0;
+                let code = inner.1;
+                state.set_code(who, code);
+            }
         };
 
         // TODO: Add more cheat codes.
-
         Capture::Exit((ExitReason::Succeed(ExitSucceed::Stopped), res))
     }
 
@@ -402,8 +477,14 @@ impl<'a, B: Backend> CheatcodeStackExecutor<'a, B> {
             }
         }
 
-        if let Some(precompile) = self.handler.precompile().get(&code_address) {
-            return match (*precompile)(&input, Some(gas_limit), &context, is_static) {
+        if let Some(result) = self.handler.precompiles().execute(
+            code_address,
+            &input,
+            Some(gas_limit),
+            &context,
+            is_static,
+        ) {
+            return match result {
                 Ok(PrecompileOutput { exit_status, output, cost, logs }) => {
                     for Log { address, topics, data } in logs {
                         match self.log(address, topics, data) {
@@ -417,8 +498,15 @@ impl<'a, B: Backend> CheatcodeStackExecutor<'a, B> {
                     Capture::Exit((ExitReason::Succeed(exit_status), output))
                 }
                 Err(e) => {
+                    let e = match e {
+                        PrecompileFailure::Error { exit_status } => ExitReason::Error(exit_status),
+                        PrecompileFailure::Revert { exit_status, .. } => {
+                            ExitReason::Revert(exit_status)
+                        }
+                        PrecompileFailure::Fatal { exit_status } => ExitReason::Fatal(exit_status),
+                    };
                     let _ = self.handler.exit_substate(StackExitKind::Failed);
-                    Capture::Exit((ExitReason::Error(e), Vec::new()))
+                    Capture::Exit((e, Vec::new()))
                 }
             }
         }
@@ -430,7 +518,6 @@ impl<'a, B: Backend> CheatcodeStackExecutor<'a, B> {
         let reason = self.execute(&mut runtime);
         // // log::debug!(target: "evm", "Call execution using address {}: {:?}", code_address,
         // reason);
-
         match reason {
             ExitReason::Succeed(s) => {
                 let _ = self.handler.exit_substate(StackExitKind::Succeeded);
@@ -451,11 +538,167 @@ impl<'a, B: Backend> CheatcodeStackExecutor<'a, B> {
             }
         }
     }
+
+    // NB: This function is copy-pasted from uptream's call_inner
+    fn create_inner(
+        &mut self,
+        caller: H160,
+        scheme: CreateScheme,
+        value: U256,
+        init_code: Vec<u8>,
+        target_gas: Option<u64>,
+        take_l64: bool,
+    ) -> Capture<(ExitReason, Option<H160>, Vec<u8>), Infallible> {
+        macro_rules! try_or_fail {
+            ( $e:expr ) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(e) => return Capture::Exit((e.into(), None, Vec::new())),
+                }
+            };
+        }
+
+        fn check_first_byte(config: &Config, code: &[u8]) -> Result<(), ExitError> {
+            if config.disallow_executable_format {
+                if let Some(0xef) = code.get(0) {
+                    return Err(ExitError::InvalidCode)
+                }
+            }
+            Ok(())
+        }
+
+        fn l64(gas: u64) -> u64 {
+            gas - gas / 64
+        }
+
+        let address = self.create_address(scheme);
+
+        self.state_mut().metadata_mut().access_address(caller);
+        self.state_mut().metadata_mut().access_address(address);
+
+        if let Some(depth) = self.state().metadata().depth() {
+            if depth > self.config().call_stack_limit {
+                return Capture::Exit((ExitError::CallTooDeep.into(), None, Vec::new()))
+            }
+        }
+
+        if self.balance(caller) < value {
+            return Capture::Exit((ExitError::OutOfFund.into(), None, Vec::new()))
+        }
+
+        let after_gas = if take_l64 && self.config().call_l64_after_gas {
+            if self.config().estimate {
+                let initial_after_gas = self.state().metadata().gasometer().gas();
+                let diff = initial_after_gas - l64(initial_after_gas);
+                try_or_fail!(self.state_mut().metadata_mut().gasometer_mut().record_cost(diff));
+                self.state().metadata().gasometer().gas()
+            } else {
+                l64(self.state().metadata().gasometer().gas())
+            }
+        } else {
+            self.state().metadata().gasometer().gas()
+        };
+
+        let target_gas = target_gas.unwrap_or(after_gas);
+
+        let gas_limit = core::cmp::min(after_gas, target_gas);
+        try_or_fail!(self.state_mut().metadata_mut().gasometer_mut().record_cost(gas_limit));
+
+        self.state_mut().inc_nonce(caller);
+
+        self.handler.enter_substate(gas_limit, false);
+
+        {
+            if self.code_size(address) != U256::zero() {
+                let _ = self.handler.exit_substate(StackExitKind::Failed);
+                return Capture::Exit((ExitError::CreateCollision.into(), None, Vec::new()))
+            }
+
+            if self.handler.nonce(address) > U256::zero() {
+                let _ = self.handler.exit_substate(StackExitKind::Failed);
+                return Capture::Exit((ExitError::CreateCollision.into(), None, Vec::new()))
+            }
+
+            self.state_mut().reset_storage(address);
+        }
+
+        let context = Context { address, caller, apparent_value: value };
+        let transfer = Transfer { source: caller, target: address, value };
+        match self.state_mut().transfer(transfer) {
+            Ok(()) => (),
+            Err(e) => {
+                let _ = self.handler.exit_substate(StackExitKind::Reverted);
+                return Capture::Exit((ExitReason::Error(e), None, Vec::new()))
+            }
+        }
+
+        if self.config().create_increase_nonce {
+            self.state_mut().inc_nonce(address);
+        }
+
+        let config = self.config().clone();
+        let mut runtime = Runtime::new(Rc::new(init_code), Rc::new(Vec::new()), context, &config);
+
+        let reason = self.execute(&mut runtime);
+        // log::debug!(target: "evm", "Create execution using address {}: {:?}", address, reason);
+
+        match reason {
+            ExitReason::Succeed(s) => {
+                let out = runtime.machine().return_value();
+
+                // As of EIP-3541 code starting with 0xef cannot be deployed
+                if let Err(e) = check_first_byte(self.config(), &out) {
+                    self.state_mut().metadata_mut().gasometer_mut().fail();
+                    let _ = self.handler.exit_substate(StackExitKind::Failed);
+                    return Capture::Exit((e.into(), None, Vec::new()))
+                }
+
+                if let Some(limit) = self.config().create_contract_limit {
+                    if out.len() > limit {
+                        self.state_mut().metadata_mut().gasometer_mut().fail();
+                        let _ = self.handler.exit_substate(StackExitKind::Failed);
+                        return Capture::Exit((
+                            ExitError::CreateContractLimit.into(),
+                            None,
+                            Vec::new(),
+                        ))
+                    }
+                }
+
+                match self.state_mut().metadata_mut().gasometer_mut().record_deposit(out.len()) {
+                    Ok(()) => {
+                        let e = self.handler.exit_substate(StackExitKind::Succeeded);
+                        self.state_mut().set_code(address, out);
+                        try_or_fail!(e);
+                        Capture::Exit((ExitReason::Succeed(s), Some(address), Vec::new()))
+                    }
+                    Err(e) => {
+                        let _ = self.handler.exit_substate(StackExitKind::Failed);
+                        Capture::Exit((ExitReason::Error(e), None, Vec::new()))
+                    }
+                }
+            }
+            ExitReason::Error(e) => {
+                self.state_mut().metadata_mut().gasometer_mut().fail();
+                let _ = self.handler.exit_substate(StackExitKind::Failed);
+                Capture::Exit((ExitReason::Error(e), None, Vec::new()))
+            }
+            ExitReason::Revert(e) => {
+                let _ = self.handler.exit_substate(StackExitKind::Reverted);
+                Capture::Exit((ExitReason::Revert(e), None, runtime.machine().return_value()))
+            }
+            ExitReason::Fatal(e) => {
+                self.state_mut().metadata_mut().gasometer_mut().fail();
+                let _ = self.handler.exit_substate(StackExitKind::Failed);
+                Capture::Exit((ExitReason::Fatal(e), None, Vec::new()))
+            }
+        }
+    }
 }
 
 // Delegates everything internally, except the `call_inner` call, which is hooked
 // so that we can modify
-impl<'a, B: Backend> Handler for CheatcodeStackExecutor<'a, B> {
+impl<'a, 'b, B: Backend, P: PrecompileSet> Handler for CheatcodeStackExecutor<'a, 'b, B, P> {
     type CreateInterrupt = Infallible;
     type CreateFeedback = Infallible;
     type CallInterrupt = Infallible;
@@ -475,7 +718,7 @@ impl<'a, B: Backend> Handler for CheatcodeStackExecutor<'a, B> {
         // NB: This is very similar to how Optimism's custom intercept logic to "predeploys" work
         // (e.g. with the StateManager)
         if code_address == *CHEATCODE_ADDRESS {
-            self.apply_cheatcode(input)
+            self.apply_cheatcode(input, transfer, target_gas)
         } else {
             self.handler.call(code_address, transfer, input, target_gas, is_static, context)
         }
@@ -544,6 +787,10 @@ impl<'a, B: Backend> Handler for CheatcodeStackExecutor<'a, B> {
         self.handler.block_gas_limit()
     }
 
+    fn block_base_fee_per_gas(&self) -> U256 {
+        self.handler.block_base_fee_per_gas()
+    }
+
     fn chain_id(&self) -> U256 {
         self.handler.chain_id()
     }
@@ -601,7 +848,7 @@ mod tests {
         fuzz::FuzzedExecutor,
         sputnik::{
             helpers::{new_backend, new_vicinity},
-            Executor,
+            Executor, PRECOMPILES_MAP,
         },
         test_helpers::COMPILED,
         Evm,
@@ -615,11 +862,13 @@ mod tests {
         let vicinity = new_vicinity();
         let backend = new_backend(&vicinity, Default::default());
         let gas_limit = 10_000_000;
-        let mut evm = Executor::new_with_cheatcodes(backend, gas_limit, &config, true);
+        let precompiles = PRECOMPILES_MAP.clone();
+        let mut evm =
+            Executor::new_with_cheatcodes(backend, gas_limit, &config, &precompiles, true);
 
-        let compiled = COMPILED.get("DebugLogs").expect("could not find contract");
+        let compiled = COMPILED.find("DebugLogs").expect("could not find contract");
         let (addr, _, _, _) =
-            evm.deploy(Address::zero(), compiled.bytecode.clone(), 0.into()).unwrap();
+            evm.deploy(Address::zero(), compiled.bin.unwrap().clone(), 0.into()).unwrap();
 
         // after the evm call is done, we call `logs` and print it all to the user
         let (_, _, _, logs) =
@@ -654,11 +903,13 @@ mod tests {
         let vicinity = new_vicinity();
         let backend = new_backend(&vicinity, Default::default());
         let gas_limit = 10_000_000;
-        let mut evm = Executor::new_with_cheatcodes(backend, gas_limit, &config, true);
+        let precompiles = PRECOMPILES_MAP.clone();
+        let mut evm =
+            Executor::new_with_cheatcodes(backend, gas_limit, &config, &precompiles, true);
 
-        let compiled = COMPILED.get("CheatCodes").expect("could not find contract");
+        let compiled = COMPILED.find("CheatCodes").expect("could not find contract");
         let (addr, _, _, _) =
-            evm.deploy(Address::zero(), compiled.bytecode.clone(), 0.into()).unwrap();
+            evm.deploy(Address::zero(), compiled.bin.unwrap().clone(), 0.into()).unwrap();
 
         let state = evm.state().clone();
         let mut cfg = proptest::test_runner::Config::default();
@@ -674,9 +925,10 @@ mod tests {
             .unwrap();
         assert_eq!(slot, 10.into());
 
-        let evm = FuzzedExecutor::new(&mut evm, runner);
+        let evm = FuzzedExecutor::new(&mut evm, runner, Address::zero());
 
-        for func in compiled.abi.functions().filter(|func| func.name.starts_with("test")) {
+        let abi = compiled.abi.as_ref().unwrap();
+        for func in abi.functions().filter(|func| func.name.starts_with("test")) {
             let should_fail = func.name.starts_with("testFail");
             if func.inputs.is_empty() {
                 let (_, reason, _, _) =
@@ -697,11 +949,13 @@ mod tests {
         let vicinity = new_vicinity();
         let backend = new_backend(&vicinity, Default::default());
         let gas_limit = 10_000_000;
-        let mut evm = Executor::new_with_cheatcodes(backend, gas_limit, &config, false);
+        let precompiles = PRECOMPILES_MAP.clone();
+        let mut evm =
+            Executor::new_with_cheatcodes(backend, gas_limit, &config, &precompiles, false);
 
-        let compiled = COMPILED.get("CheatCodes").expect("could not find contract");
+        let compiled = COMPILED.find("CheatCodes").expect("could not find contract");
         let (addr, _, _, _) =
-            evm.deploy(Address::zero(), compiled.bytecode.clone(), 0.into()).unwrap();
+            evm.deploy(Address::zero(), compiled.bin.unwrap().clone(), 0.into()).unwrap();
 
         let err =
             evm.call::<(), _, _>(Address::zero(), addr, "testFFI()", (), 0.into()).unwrap_err();
