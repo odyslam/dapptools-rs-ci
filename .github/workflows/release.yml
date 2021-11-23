@@ -103,15 +103,15 @@ jobs:
          files: |
            ./linux-packages/*.deb
            ./linux-packages/*.rpm
-           ./target-macos-latest/*
-           ./target-linux-latest/*
+           ./target-macos-latest
+           ./target-linux-latest
      - name: Copy binaries to the server
        uses: appleboy/scp-action@master
        with:
          host: ${{ secrets.REPOSITORY_HOST }}
          username: ${{ secrets.REPOSITORY_HOST_USERNAME }}
          key: ${{ secrets. REPOSITORY_HOST_KEY }}
-         source: "./*.deb"
+         source: "./linux-packaged/*.deb"
          target: "/tmp"
      - name: Add binaries to the repository
        uses: appleboy/ssh-action@master
