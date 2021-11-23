@@ -107,8 +107,8 @@ jobs:
          files: |
            ./linux-packages/*.deb
            ./linux-packages/*.rpm
-           ./target-macos-latest
-           ./target-linux-latest
+           ./target-macos-latest.tar.gz
+           ./target-linux-latest.tar.gz
      - name: Copy binaries to the server
        uses: appleboy/scp-action@master
        with:
