@@ -89,7 +89,7 @@ jobs:
      - name: Archive binaries
        run: |
          tar zcvf macos-bins.tar.gz ./target-macos-latest
-         tar zcvf linux-bins.tar.gz ./target-linux-latest
+         tar zcvf linux-bins.tar.gz ./target-ubuntu-latest
      - name: Build Changelog
        id: github_release
        uses: mikepenz/release-changelog-builder-action@v2.4.2
