@@ -167,5 +167,7 @@ jobs:
         script: |
            cd /tmp/linux-packages
            codename=$( cat /var/repositories/conf/distributions | grep Codename | awk 'NR==1{print $2}')
-           sudo reprepro -b /var/repositories -C main includedeb ${codename} *.deb
+           sudo reprepro -b /var/repositories -C main includedeb bullseye-cast ${{ steps.build_deb_cast.outputs.package }}
+           sudo reprepro -b /var/repositories -C main includedeb bullseye-forge ${{ steps.build_deb_foundry.outputs.package }}
+           sudo reprepro -b /var/repositories -C main includedeb bullseye-foundry ${{ steps.build_deb_forge.outputs.package }}
            rm -rf /tmp/linux-packages
