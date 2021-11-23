@@ -1,0 +1,12 @@
+meta:
+  description: Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.
+  maintainer: Odysseas Lamtzidis
+files:
+  "/usr/bin/forge":
+    file: target/release/forge
+    mode: "0755"
+    user: "root"
+  "/usr/bin/cast":
+    file: target/release/cast
+    mode: "0755"
+    user: "root"
