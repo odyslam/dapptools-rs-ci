@@ -1,3 +1,4 @@
+//! Simple in-memory cache backend for use with forking providers
 use std::{cell::RefCell, collections::BTreeMap};
 
 use ethers::{
@@ -40,9 +41,13 @@ impl<B: Backend, M: Middleware> ForkMemoryBackend<B, M>
 where
     M::Error: 'static,
 {
-    pub fn new(provider: M, backend: B, pin_block: Option<u64>) -> Self {
+    pub fn new(
+        provider: M,
+        backend: B,
+        pin_block: Option<u64>,
+        init_cache: BTreeMap<H160, MemoryAccount>,
+    ) -> Self {
         let provider = BlockingProvider::new(provider);
-        let pin_block = pin_block.unwrap_or_else(|| backend.block_number().as_u64()).into();
 
         // get the remaining block metadata
         let (block, chain_id) =
@@ -51,8 +56,8 @@ where
         Self {
             provider,
             backend,
-            cache: Default::default(),
-            pin_block: Some(pin_block),
+            cache: RefCell::new(init_cache),
+            pin_block: pin_block.map(Into::into),
             pin_block_meta: block,
             chain_id,
         }
@@ -104,6 +109,10 @@ where
         self.pin_block_meta.gas_limit
     }
 
+    fn block_base_fee_per_gas(&self) -> U256 {
+        self.pin_block_meta.base_fee_per_gas.unwrap_or_default()
+    }
+
     fn chain_id(&self) -> U256 {
         self.chain_id
     }
@@ -133,36 +142,52 @@ where
 
     fn basic(&self, address: H160) -> Basic {
         let mut cache = self.cache.borrow_mut();
-        cache.get(&address).map(|a| Basic { balance: a.balance, nonce: a.nonce }).unwrap_or_else(
-            || {
-                let account =
-                    self.provider.get_account(address, self.pin_block).unwrap_or_default();
-                if let Some(acc) = cache.get_mut(&address) {
-                    acc.nonce = account.0;
-                    acc.balance = account.1;
-                }
-                Basic { nonce: account.0, balance: account.1 }
-            },
-        )
+        let account = cache.entry(address).or_insert_with(|| {
+            let res = self.provider.get_account(address, self.pin_block).unwrap_or_default();
+            MemoryAccount {
+                nonce: res.0,
+                balance: res.1,
+                code: res.2.to_vec(),
+                storage: Default::default(),
+            }
+        });
+        Basic { balance: account.balance, nonce: account.nonce }
     }
 
     fn code(&self, address: H160) -> Vec<u8> {
         let mut cache = self.cache.borrow_mut();
-        cache.get(&address).map(|v| v.code.clone()).unwrap_or_else(|| {
-            let code = self.provider.get_code(address, self.pin_block).unwrap_or_default().to_vec();
-            if let Some(acc) = cache.get_mut(&address) {
-                acc.code = code.clone()
+        let account = cache.entry(address).or_insert_with(|| {
+            // println!("didnt have account code {:?}", address);
+            let res = self.provider.get_account(address, self.pin_block).unwrap_or_default();
+            MemoryAccount {
+                nonce: res.0,
+                balance: res.1,
+                code: res.2.to_vec(),
+                storage: Default::default(),
             }
-            code
-        })
+        });
+        account.code.clone()
     }
 
     fn storage(&self, address: H160, index: H256) -> H256 {
         let mut cache = self.cache.borrow_mut();
-        let account = cache.get_mut(&address);
-        account.map(|acct| acct.storage.get(&index)).flatten().copied().unwrap_or_else(|| {
-            self.provider.get_storage_at(address, index, self.pin_block).unwrap_or_default()
-        })
+        let account = cache.entry(address).or_insert_with(|| {
+            let res = self.provider.get_account(address, self.pin_block).unwrap_or_default();
+            MemoryAccount {
+                nonce: res.0,
+                balance: res.1,
+                code: res.2.to_vec(),
+                storage: Default::default(),
+            }
+        });
+        if let Some(val) = account.storage.get(&index) {
+            *val
+        } else {
+            let ret =
+                self.provider.get_storage_at(address, index, self.pin_block).unwrap_or_default();
+            account.storage.insert(index, ret);
+            ret
+        }
     }
 
     fn original_storage(&self, address: H160, index: H256) -> Option<H256> {
@@ -182,7 +207,7 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use crate::{
-        sputnik::{helpers::new_backend, vicinity, Executor},
+        sputnik::{helpers::new_backend, vicinity, Executor, PRECOMPILES_MAP},
         test_helpers::COMPILED,
         Evm,
     };
@@ -192,7 +217,7 @@ mod tests {
     #[test]
     fn forked_backend() {
         let cfg = Config::istanbul();
-        let compiled = COMPILED.get("Greeter").expect("could not find contract");
+        let compiled = COMPILED.find("Greeter").expect("could not find contract");
 
         let provider = Provider::<Http>::try_from(
             "https://mainnet.infura.io/v3/c60b0bb42f8a4c6481ecd229eddaca27",
@@ -202,12 +227,13 @@ mod tests {
         let blk = Some(13292465);
         let vicinity = rt.block_on(vicinity(&provider, blk)).unwrap();
         let backend = new_backend(&vicinity, Default::default());
-        let backend = ForkMemoryBackend::new(provider, backend, blk);
+        let backend = ForkMemoryBackend::new(provider, backend, blk, Default::default());
 
-        let mut evm = Executor::new(12_000_000, &cfg, &backend);
+        let precompiles = PRECOMPILES_MAP.clone();
+        let mut evm = Executor::new(12_000_000, &cfg, &backend, &precompiles);
 
         let (addr, _, _, _) =
-            evm.deploy(Address::zero(), compiled.bytecode.clone(), 0.into()).unwrap();
+            evm.deploy(Address::zero(), compiled.bin.unwrap().clone(), 0.into()).unwrap();
 
         let (res, _, _, _) =
             evm.call::<U256, _, _>(Address::zero(), addr, "time()(uint256)", (), 0.into()).unwrap();

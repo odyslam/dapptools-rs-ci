@@ -1,3 +1,5 @@
+//! Hooks over Sputnik EVM execution which allow runtime logging and modification of chain state
+//! from Solidity (cheatcodes).
 pub mod memory_stackstate_owned;
 
 pub mod cheatcode_handler;
@@ -5,7 +7,7 @@ use std::collections::HashMap;
 
 pub use cheatcode_handler::CheatcodeHandler;
 
-mod backend;
+pub mod backend;
 
 use ethers::types::{Address, H256, U256};
 use sputnik::backend::{Backend, MemoryAccount, MemoryBackend};
@@ -14,11 +16,18 @@ use sputnik::backend::{Backend, MemoryAccount, MemoryBackend};
 /// Cheatcodes can be used to control the EVM context during setup or runtime,
 /// which can be useful for simulations or specialized unit tests
 pub struct Cheatcodes {
+    /// The overriden block number
     pub block_number: Option<U256>,
+    /// The overriden timestamp
     pub block_timestamp: Option<U256>,
+    /// The overriden basefee
+    pub block_base_fee_per_gas: Option<U256>,
+    /// The overriden storage slots
     pub accounts: HashMap<Address, MemoryAccount>,
 }
 
+/// Extension trait over [`Backend`] which provides additional methods for interacting with the
+/// state
 pub trait BackendExt: Backend {
     fn set_storage(&mut self, address: Address, slot: H256, value: H256);
 }
@@ -41,6 +50,9 @@ ethers::contract::abigen!(
             ffi(string[])(bytes)
             addr(uint256)(address)
             sign(uint256,bytes32)(uint8,bytes32,bytes32)
+            prank(address,address,bytes)(bool,bytes)
+            deal(address,uint256)
+            etch(address,bytes)
     ]"#,
 );
 pub use hevm_mod::HEVMCalls;

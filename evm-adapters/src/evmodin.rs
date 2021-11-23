@@ -8,6 +8,7 @@ use eyre::Result;
 
 // TODO: Check if we can implement this as the base layer of an ethers-provider
 // Middleware stack instead of doing RPC calls.
+/// Wrapper around EVModin which implements the [Evm](`crate::Evm`) trait
 #[derive(Clone, Debug)]
 pub struct EvmOdin<S, T> {
     pub host: S,
@@ -91,7 +92,10 @@ impl<S: HostExt, Tr: Tracer> Evm<S> for EvmOdin<S, Tr> {
         #[allow(deprecated)]
         let message = Message {
             sender: from,
-            destination: to,
+            recipient: to,
+            // This is only going to be different from `recipient` if
+            // used in a `CALLCODE` or `DELEGATECALL`, but here we're only doing calls
+            code_address: to,
             // What should this be?
             depth: 0,
             kind: self.call_kind.unwrap_or(CallKind::Call),
@@ -152,7 +156,7 @@ mod tests {
     // TODO: Ignore until we figure out how to deploy stuff in evmodin
     fn evmodin_can_call_vm_directly() {
         let revision = Revision::Istanbul;
-        let compiled = COMPILED.get("Greeter").expect("could not find contract");
+        let compiled = COMPILED.find("Greeter").expect("could not find contract");
 
         let host = MockedHost::default();
 
@@ -167,7 +171,7 @@ mod tests {
     #[ignore]
     fn evmodin_can_call_solidity_unit_test() {
         let revision = Revision::Istanbul;
-        let compiled = COMPILED.get("Greeter").expect("could not find contract");
+        let compiled = COMPILED.find("Greeter").expect("could not find contract");
         let host = MockedHost::default();
         let gas_limit = 12_000_000;
         let evm = EvmOdin::new(host, gas_limit, revision, NoopTracer);
