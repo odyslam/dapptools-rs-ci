@@ -92,7 +92,7 @@ jobs:
           version: ${{ steps.vars.outputs.tag }}
           arch: x86_64
           format: deb
-          package: packaging/foundry.ymll
+          package: packaging/foundry.yml
       - uses: kentik/pkg@v1.0.0-rc7
         name: Build forge DEB package
         id: build_deb_forge
