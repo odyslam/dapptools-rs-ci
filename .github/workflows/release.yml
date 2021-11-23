@@ -111,7 +111,7 @@ jobs:
          host: ${{ secrets.REPOSITORY_HOST }}
          username: ${{ secrets.REPOSITORY_HOST_USERNAME }}
          key: ${{ secrets. REPOSITORY_HOST_KEY }}
-         source: "./linux-packaged/*.deb"
+         source: "./linux-packages/*.deb"
          target: "/tmp"
      - name: Add binaries to the repository
        uses: appleboy/ssh-action@master
