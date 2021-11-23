@@ -86,6 +86,10 @@ jobs:
        run: echo ::set-output name=tag::${GITHUB_REF#refs/*/}
      - name: Restore artifacts
        uses: actions/download-artifact@v2
+     - name: Archive binaries
+       run: |
+         tar -zcvf macos-bins.tar.gz ./target-macos-latest
+         tar -zcvf linux-bins.tar.gz ./target-macos-latest
      - name: Build Changelog
        id: github_release
        uses: mikepenz/release-changelog-builder-action@v2.4.2
@@ -121,7 +125,7 @@ jobs:
         key: ${{ secrets. REPOSITORY_HOST_KEY }}
         script_stop: true
         script: |
-           cd /tmp
+           cd /tmp/linux-packages
            codename=$( cat /var/repositories/conf/distributions | grep Codename | awk '{print $2}')
            sudo reprepro -b /var/repositories -C main includedeb ${codename} *.deb
-           rm /tmp/*.deb
+           rm -rf /tmp/linux-packages
